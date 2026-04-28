@@ -1,0 +1,227 @@
+import os
+import json
+import time
+import csv
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from openai import OpenAI, APIError
+from tqdm import tqdm
+
+
+try:
+    client = OpenAI(
+        api_key="",
+        base_url=""
+    )
+except Exception as e:
+    print(f"Failed to initialize OpenAI client: {e}")
+    exit()
+
+#
+MODEL_NAME = ""
+
+PROMPT_TEMPLATE = """
+你是一名鼻咽癌临床肿瘤医生，需要根据患者病例信息判断鼻咽癌的T分期、N分期和M分期。若报告中明确存在某一级别所要求的结构侵犯或转移证据，则归入该级；若同时满足多个级别，则以最高级为准；若报告中未明确记载某一级别所要求的关键证据，则不能分入该级。请按以下步骤进行：
+1. 分析患者的影像报告，识别原发肿瘤侵犯范围、是否存在淋巴结转移和远处转移。
+2. 根据最新的分期标准，为患者预测肿瘤的T（原发肿瘤）、N（区域淋巴结）、M（远处转移）分期。
+3. 输出分期结果并提供病历关键信息。
+
+
+【输出格式】
+输出结果包含:
+- T分期结果：直接输出最终T分期，无需其他任何信息
+- T摘取的病历关键信息：直接摘取病历原文中与判断T分期相关的内容，不需总结、分析
+- N分期结果：直接输出最终N分期，无需其他任何信息
+- N摘取的病历关键信息：直接摘取病历原文中与判断N分期相关的内容，不需总结、分析
+- M分期结果：直接输出最终M分期，无需其他任何信息
+- M摘取的病历关键信息：直接摘取病历原文中与判断M分期相关的内容，不需总结、分析
+
+请以json的格式输出，输出内容格式如下(请确保输出json格式如下):
+{{
+    "T_stage_val":"T分期结果",
+    "T_stage_source":"T摘取的病历关键信息",
+    "N_stage_val":"N分期结果",
+    "N_stage_source":"N摘取的病历关键信息",
+    "M_stage_val":"M分期结果",
+    "M_stage_source":"M摘取的病历关键信息"
+}}
+强调：结果仅输出上述json，不要输出其他内容。
+举例：
+{{
+    "T_stage_val":"2",
+    "T_stage_source":"肿瘤侵犯咽旁间隙",
+    "N_stage_val":"2",
+    "N_stage_source":"双颈淋巴结转移，最大短径12mm",
+    "M_stage_val":"0",
+    "M_stage_source":"无远处转移"
+}}
+【病历信息】：
+{patient_case_record}
+"""
+
+
+SYSTEM_PROMPT = "你是一名专业的鼻咽癌临床肿瘤医生，擅长TNM分期判断。请严格按照要求输出JSON格式结果。"
+
+
+PATIENT_CASE_RECORD_TEMPLATE = """
+MR检查所见:
+{mr_report}
+PET检查所见:
+{pet_report}
+CT检查结论:
+{ct_report}
+骨扫描结论:
+{bone_scan}
+"""
+
+
+def load_patients_from_excel(file_path: str) -> list:
+    try:
+        df = pd.read_excel(file_path, dtype=str)
+        df.fillna('', inplace=True)
+        patients_list = df.to_dict('records')
+        print(f"Loaded {len(patients_list)} patient records from {file_path}.")
+        return patients_list
+    except FileNotFoundError:
+        print(f"Error: file not found: {file_path}.")
+        return []
+    except Exception as e:
+        print(f"Error while reading Excel file: {e}")
+        return []
+
+
+def extract_json_from_content(raw_content: str):
+    try:
+        start_index = raw_content.find('{')
+        end_index = raw_content.rfind('}') + 1
+
+        if start_index != -1 and end_index > start_index:
+            json_str = raw_content[start_index:end_index]
+            return json.loads(json_str)
+        else:
+            raise ValueError("No valid JSON object was found in the API response.")
+    except (json.JSONDecodeError, ValueError) as parse_error:
+        raise ValueError(f"Failed to parse JSON: {parse_error}") from parse_error
+
+
+def normalize_prediction_data(prediction_data, raw_content: str) -> dict:
+    target_dict = None
+    if isinstance(prediction_data, dict):
+        target_dict = prediction_data
+    elif isinstance(prediction_data, list) and prediction_data:
+        if isinstance(prediction_data[0], dict):
+            target_dict = prediction_data[0]
+
+    if target_dict is None:
+        raise TypeError(f"Failed to extract a valid dictionary object. API response: {raw_content}")
+
+    return target_dict
+
+
+def get_tnm_prediction(patient_record: dict) -> dict | None:
+    global client, MODEL_NAME
+    case_record_text = PATIENT_CASE_RECORD_TEMPLATE.format(
+        mr_report=patient_record.get("mr_report", ""),
+        pet_report=patient_record.get("pet_report", ""),
+        ct_report=patient_record.get("ct_report", ""),
+        bone_scan=patient_record.get("bone_scan", "")
+    )
+    user_prompt = PROMPT_TEMPLATE.format(
+        patient_case_record=case_record_text
+    )
+
+    raw_content = None
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            stream=False,
+            timeout=180
+        )
+
+        raw_content = response.choices[0].message.content
+        prediction_data = extract_json_from_content(raw_content)
+        target_dict = normalize_prediction_data(prediction_data, raw_content)
+
+        target_dict['custom_id'] = patient_record['custom_id']
+        return target_dict
+
+    except Exception as e:
+
+        if raw_content:
+            raise type(e)(f"{e} | Raw response: {raw_content}")
+        else:
+            raise e
+
+def save_results(results: list, base_filename: str):
+    if not results:
+        print("Result list is empty; nothing to save.")
+        return
+
+    json_output_path = f"{base_filename}.json"
+    with open(json_output_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+    print(f"Saved {len(results)} results to JSON file: {json_output_path}")
+
+    csv_output_path = f"{base_filename}.csv"
+    all_fieldnames = set()
+    for res in results:
+        all_fieldnames.update(res.keys())
+
+    with open(csv_output_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=sorted(list(all_fieldnames)))
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"Saved {len(results)} results to CSV file: {csv_output_path}")
+
+
+if __name__ == "__main__":
+    EXCEL_FILE_NAME = 'data.xlsx'
+    patients_data = load_patients_from_excel(EXCEL_FILE_NAME)
+    all_results = []
+
+    if not patients_data:
+        print("Data loading failed or the file is empty. Program stopped.")
+    else:
+        print(f"\nStarting parallel processing for {len(patients_data)} patient records (model: {MODEL_NAME})...")
+
+        success_count = 0
+        failure_count = 0
+
+        try:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_id = {
+                    executor.submit(get_tnm_prediction, patient): patient['custom_id']
+                    for patient in patients_data
+                }
+
+                pbar = tqdm(total=len(patients_data), desc="Processing progress", unit="record")
+
+                for future in as_completed(future_to_id):
+                    patient_id = future_to_id[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            all_results.append(result)
+                            success_count += 1
+                            pbar.set_postfix(last_id=patient_id, success=success_count, failure=failure_count)
+
+                    except Exception as e:
+                        failure_count += 1
+                        pbar.set_postfix(last_id=patient_id, success=success_count, failure=failure_count)
+                        pbar.write(f"[ERROR] Failed to process ID {patient_id}: {e}")
+
+                    pbar.update(1)
+
+                pbar.close()
+
+        except KeyboardInterrupt:
+            print("\nProcessing interrupted by user.")
+
+        finally:
+            print("\n--- Running final save step ---")
+            save_results(all_results, "result.xlsx")
